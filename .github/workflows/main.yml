@@ -1,15 +1,17 @@
-name: RDP
+name: RDP 24/7 - No Disconnect
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
 
 jobs:
   rdp-forever:
     runs-on: windows-latest
-    timeout-minutes: 360  # 6 ساعات = الحد الأقصى (GitHub يقتل بعدها)
+    timeout-minutes: 360
 
     steps:
-      - name: تفعيل RDP + فتح البورت
+      - name: Enable RDP and open port
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
@@ -17,72 +19,75 @@ jobs:
           netsh advfirewall firewall add rule name="RDP-Forever" dir=in action=allow protocol=TCP localport=3389
           Restart-Service TermService -Force
 
-      - name: إنشاء مستخدم RDP (من Secrets)
+      - name: Create RDP user from secrets
         env:
           USER: ${{ secrets.RDP_USER }}
           PASS: ${{ secrets.RDP_PASS }}
         run: |
           if (-not $env:USER -or -not $env:PASS) {
-            Write-Error "اضبطي RDP_USER و RDP_PASS في Secrets"
+            Write-Error "RDP_USER and RDP_PASS must be set in Secrets"
             exit 1
           }
           $sec = ConvertTo-SecureString $env:PASS -AsPlainText -Force
           if (-not (Get-LocalUser -Name $env:USER -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $env:USER -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group "Administrators" -Member $env:USER
+            New-LocalUser -Name $env:USER -Password $sec -AccountNeverExpires -PasswordNeverExpires:$true
+            Add-LocalGroupMember -Group "Administrators" -Member $env:USER -ErrorAction SilentlyContinue
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:USER
           }
           echo "RDP_USER=$env:USER" >> $env:GITHUB_ENV
           echo "RDP_PASS=$env:PASS" >> $env:GITHUB_ENV
 
-      - name: تثبيت Tailscale
+      - name: Install and start Tailscale
         env:
           KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          if (-not $env:KEY) {
+            Write-Error "TAILSCALE_AUTH_KEY must be set in Secrets"
+            exit 1
+          }
           $url = "https://pkgs.tailscale.com/stable/tailscale_latest_amd64.msi"
           $path = "$env:TEMP\tailscale.msi"
-          iwr $url -OutFile $path
-          msiexec /i "$path" /quiet /norestart | Out-Null
+          Invoke-WebRequest $url -OutFile $path
+          Start-Process msiexec.exe -ArgumentList '/i', $path, '/quiet', '/norestart' -Wait
           Remove-Item $path -Force
 
-          $hostname = "my-rdp-forever"  # نفس الاسم = نفس الـ IP دايمًا
+          $hostname = "my-rdp-forever"
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
             --authkey=$env:KEY `
             --hostname=$hostname `
             --accept-routes `
             --accept-dns=false
 
-          # انتظري الـ IP
           $ip = $null
           for ($i = 0; $i -lt 15 -and -not $ip; $i++) {
-            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select -First 1
+            $ip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 | Select-Object -First 1
             if (-not $ip) { Start-Sleep -Seconds 4 }
           }
-          if (-not $ip) { Write-Error "Tailscale فشل" ; exit 1 }
+          if (-not $ip) { Write-Error "Failed to obtain IP" ; exit 1 }
 
           echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "IP ثابت: $ip"
+          Write-Host "IP: $ip"
 
-      - name: عرض بيانات الاتصال (مرة واحدة)
+      - name: Display connection details
         run: |
           Write-Host "`n"
           Write-Host "============================================"
-          Write-Host "           RDP جاهز ومش هيفصل!"
-          Write-Host "   العنوان: $($env:TAILSCALE_IP)"
-          Write-Host "   المستخدم: $($env:RDP_USER)"
-          Write-Host "   كلمة المرور: $($env:RDP_PASS)"
-          Write-Host "   الجلسة: 6 ساعات (ثم أعدي التشغيل)"
+          Write-Host " RDP ready"
+          Write-Host " Address: $($env:TAILSCALE_IP)"
+          Write-Host " User: $($env:RDP_USER)"
+          Write-Host " Password: $($env:RDP_PASS)"
+          Write-Host " Session: 6 hours (re-run after)"
           Write-Host "============================================"
-          Write-Host "`n[$(Get-Date)] الجلسة شغالة... (لا تُغلق الصفحة)"
+          Write-Host "`nSession active..."
 
-      - name: ابقي الجلسة شغالة إلى الأبد (حتى 6 ساعات)
+      - name: Keep session alive
         run: |
           $start = Get-Date
           while ($true) {
             $elapsed = (Get-Date) - $start
             $remain = 360 - [math]::Floor($elapsed.TotalMinutes)
             if ($remain -le 0) { break }
-            Write-Host "[$(Get-Date -f 'HH:mm:ss')] شغالة... باقي $remain دقيقة (أعدي التشغيل لاحقًا)"
+            Write-Host "Active... $remain minutes left"
             Start-Sleep -Seconds 60
           }
-          Write-Host "انتهت 6 ساعات. أعدي تشغيل الـ Workflow مرة تانية!"
+          Write-Host "6 hours ended - re-run workflow"
