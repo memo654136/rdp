@@ -11,7 +11,7 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and (optionally) disable Network Level Authentication (if needed)
+          # Enable Remote Desktop (keep NLA/security as-is if you prefer)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -20,20 +20,19 @@ jobs:
                              -Name "SecurityLayer" -Value 0 -Force
 
           # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No rules match the specified criteria."
+
           # For testing, allow any incoming connection on port 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          # Restart Remote Desktop service
           Restart-Service -Name TermService -Force
 
       - name: Create RDP User with Provided Password
         run: |
-          # Using the exact password requested (weak/simple)
           $username = "RDP"
-          $password = "01099975155"
+          $password = "01099975155A!"
 
           # Convert to SecureString and create local user
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -43,14 +42,18 @@ jobs:
               Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
           }
 
+          # Create the user with the secure password
           New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+
+          # Add to required groups
           Add-LocalGroupMember -Group "Administrators" -Member $username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
 
-          # Export credentials to environment for later steps (be careful: visible in logs)
+          # Export credentials to environment (be careful: visible in logs)
           echo "RDP_USER=$username" >> $env:GITHUB_ENV
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
+          # Verify user created
           if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
               Write-Error "User creation failed"
               exit 1
@@ -67,16 +70,14 @@ jobs:
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          while (-not $tsIP -and $retries -lt 12) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
-              $retries++ 
+              $retries++
           }
           
           if (-not $tsIP) {
@@ -89,8 +90,7 @@ jobs:
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
@@ -105,7 +105,6 @@ jobs:
           Write-Host "Password: $env:RDP_PASS"
           Write-Host "==================`n"
           
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
               Start-Sleep -Seconds 300
